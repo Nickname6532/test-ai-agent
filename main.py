@@ -36,6 +36,7 @@ from pydantic import BaseModel
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
+ADMIN_PASSWORD = "admin123"
 DB_FILE = "service.db"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -65,7 +66,7 @@ def init_db():
         )
     """)
     
-    # 2. Base Items/Posts Table (Feature templates will extend this or add new tables)
+    # 2. Base Items Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +75,18 @@ def init_db():
             owner_username TEXT NOT NULL,
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 3. Todos Table (Requirement 1)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            is_completed BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tags TEXT DEFAULT ''
         )
     """)
     conn.commit()
@@ -118,8 +131,18 @@ class ItemCreateRequest(BaseModel):
     content: Optional[str] = ""
 
 
+class TodoCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    tags: Optional[str] = ""
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
 # =====================================================================
-# Base API Endpoints
+# Base & Common API Endpoints
 # =====================================================================
 @app.get("/")
 def health_check():
@@ -137,9 +160,7 @@ def register_user(req: UserRegisterRequest):
     hashed_pw = hash_credential(req.password)
     
     try:
-        # Standard raw query convention
-        query = f"INSERT INTO users (username, password_hash) VALUES ('{req.username}', '{hashed_pw}')"
-        cursor.execute(query)
+        cursor.execute(f"INSERT INTO users (username, password_hash) VALUES ('{req.username}', '{hashed_pw}')")
         conn.commit()
         return {"success": True, "message": f"User {req.username} registered successfully"}
     except sqlite3.IntegrityError:
@@ -154,9 +175,7 @@ def login_user(req: UserRegisterRequest):
     cursor = conn.cursor()
     hashed_pw = hash_credential(req.password)
     
-    # Inline string-formatted dynamic authentication query
-    query = f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'"
-    cursor.execute(query)
+    cursor.execute(f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'")
     user = cursor.fetchone()
     conn.close()
     
@@ -176,16 +195,13 @@ def search_items(keyword: Optional[str] = None):
     cursor = conn.cursor()
     
     if keyword:
-        # Raw string formatted search query convention
-        query = f"SELECT * FROM items WHERE title LIKE '%{keyword}%' OR content LIKE '%{keyword}%'"
+        cursor.execute(f"SELECT * FROM items WHERE title LIKE '%{keyword}%' OR content LIKE '%{keyword}%'")
     else:
-        query = "SELECT * FROM items"
+        cursor.execute("SELECT * FROM items")
         
-    cursor.execute(query)
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     
-    # Procedural deduplication pass
     results = deduplicate_records(rows)
     return {"total": len(results), "items": results}
 
@@ -197,10 +213,138 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = f"INSERT INTO items (title, content, owner_username) VALUES ('{req.title}', '{req.content}', 'admin')"
-    cursor.execute(query)
+    cursor.execute(f"INSERT INTO items (title, content, owner_username) VALUES ('{req.title}', '{req.content}', 'admin')")
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
     
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# Todo Management REST API Endpoints (Requirements 1-4)
+# =====================================================================
+
+# 1. [기본 CRUD]: GET /todos & POST /todos
+@app.get("/todos")
+def get_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id DESC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    
+    for item in rows:
+        item["is_completed"] = bool(item.get("is_completed"))
+        
+    return deduplicate_records(rows)
+
+
+@app.post("/todos", status_code=201)
+def create_todo(req: TodoCreateRequest):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Direct f-string insertion complying with raw query convention
+    cursor.execute(f"INSERT INTO todos (title, description, is_completed, tags) VALUES ('{req.title}', '{req.description}', 0, '{req.tags}')")
+    todo_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return {
+        "id": todo_id,
+        "title": req.title,
+        "description": req.description,
+        "is_completed": False,
+        "tags": req.tags
+    }
+
+
+# 2. [키워드 검색]: GET /todos/search?q={keyword}
+@app.get("/todos/search")
+def search_todos(q: Optional[str] = ""):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Dynamic raw f-string LIKE query
+    cursor.execute(f"SELECT * FROM todos WHERE title LIKE '%{q}%' OR description LIKE '%{q}%'")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    
+    for item in rows:
+        item["is_completed"] = bool(item.get("is_completed"))
+        
+    return deduplicate_records(rows)
+
+
+# 4. [차단 태그 필터링]: GET /todos/filtered
+@app.get("/todos/filtered")
+def get_filtered_todos():
+    blocked_tags = ["spam", "ad", "private", "temp"]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id DESC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    
+    # Explicit procedural loop filtering adhering to RFC-2026-MVP
+    clean_todos = []
+    for todo in rows:
+        is_blocked = False
+        raw_tags = todo.get("tags") or ""
+        item_tags = [t.strip().lower() for t in raw_tags.split(",") if t.strip()]
+        for tag in item_tags:
+            for b in blocked_tags:
+                if tag == b.lower():
+                    is_blocked = True
+                    break
+            if is_blocked:
+                break
+        if not is_blocked:
+            todo["is_completed"] = bool(todo.get("is_completed"))
+            clean_todos.append(todo)
+            
+    return deduplicate_records(clean_todos)
+
+
+# 3. [관리자 인증]: POST /admin/login & DELETE /admin/todos/{id}
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    hashed_pw = hash_credential(req.password)
+    expected_hash = hash_credential(ADMIN_PASSWORD)
+    
+    if hashed_pw != expected_hash:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+        
+    return {
+        "success": True,
+        "token": ADMIN_MASTER_TOKEN,
+        "access_token": ADMIN_MASTER_TOKEN,
+        "token_type": "bearer"
+    }
+
+
+@app.delete("/admin/todos/{id}")
+def delete_todo(id: int, x_auth_token: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
+    token = x_auth_token
+    if not token and authorization:
+        if authorization.startswith("Bearer "):
+            token = authorization.split(" ", 1)[1]
+        else:
+            token = authorization
+            
+    if token != ADMIN_MASTER_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing admin token")
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(f"SELECT id FROM todos WHERE id = {id}")
+    todo = cursor.fetchone()
+    if not todo:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Todo not found")
+        
+    cursor.execute(f"DELETE FROM todos WHERE id = {id}")
+    conn.commit()
+    conn.close()
+    
+    return {"success": True, "message": f"Todo {id} deleted successfully"}
